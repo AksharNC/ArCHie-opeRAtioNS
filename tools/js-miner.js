@@ -1,6 +1,6 @@
 // tools/js-miner.js
 (function() {
-    console.log("⚡ CyberOps Miner: JS Recon Active");
+    console.log("⚡ ArCHie's Miners: JS Recon Active");
 
     // 1. RECON LOGIC (Secrets & Endpoints)
     const findings = [];
