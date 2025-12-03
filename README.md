@@ -38,7 +38,7 @@ Welcome to your centralized operations hub. This repository serves as both a sta
 
 This section hosts your custom JavaScript bookmarklets using the **Loader Pattern**.
 
-### 🚀 **[Launch Arsenal Installer](https://YOUR_USER.github.io/YOUR_REPO/)**
+### 🚀 **[Launch Arsenal Installer](https://AksharNC.github.io/ArCHie-opeRAtioNS/tree/main/arsenal/index.html)**
 *(Click above to drag-and-drop tools to your browser bar)*
 
 * **Source Code:** `tools/js-miner.js`
