@@ -1,102 +1,170 @@
 // tools/js-miner.js
 (function() {
-    console.log("⚡ ArCHie's Miners: JS Recon Active");
+    console.log("⚡ ArCHie's Burp-Style Miner Active");
 
-    // 1. RECON LOGIC
-    const findings = [];
+    // DATA STORAGE
+    const results = {
+        staticFiles: new Set(), // Just the .js file links
+        endpoints: new Set(),   // API routes (/api/v1/user, https://...)
+        secrets: new Set()      // Keys, Tokens, Env Vars
+    };
 
-    function findSecrets(code) {
-        const secretPatterns = [
-            /(api_key|secret|token|password|cred|auth|db_conn|private_key|aws_access_key_id|aws_secret_access_key|node_env|nodejs|node)[^=\s"']{0,20}[=\s"']{1,3}[^=\s"']{1,50}/gi,
-            /sk_[a-zA-Z0-9_]{24}/g,
-            /AKIA[0-9A-Z]{16}/g,
-            /[a-f0-9]{32}/gi,
-            /[a-f0-9]{40}/gi 
-        ];
-        secretPatterns.forEach(pattern => {
-            let match;
-            while ((match = pattern.exec(code)) !== null) {
-                findings.push({ type: "🔑 Secret", content: match[0].substring(0, 100) + (match[0].length > 100 ? "..." : "") });
+    // --- REGEX ARSENAL ---
+    
+    // 1. ENDPOINTS: Looks for strings inside quotes that start with / or http
+    // Filters out common non-endpoints like .png, .css, text/javascript
+    const regexEndpoint = /(?:"|')(((?:[a-zA-Z]{1,10}:\/\/|\/)[^"'/]{1,}\/[a-zA-Z0-9_.\-/?=&%]+)|((?:\/|\.\.\/)[a-zA-Z0-9_.\-]+\.[a-z]{2,4}))(?:"|')/gi;
+
+    // 2. SECRETS: High entropy, specific Node patterns, and standard keys
+    const regexSecrets = [
+        // AWS, Google, Stripe
+        { name: "AWS API Key", pattern: /AKIA[0-9A-Z]{16}/g },
+        { name: "AWS Secret", pattern: /(aws_secret_access_key|aws_access_key_id)[\s:=]{1,3}["']([a-zA-Z0-9/+]{40})["']/gi },
+        { name: "Stripe Key", pattern: /sk_live_[0-9a-zA-Z]{24}/g },
+        
+        // Node & Env Variables (process.env.DB_PASS, NODE_ENV = "prod")
+        { name: "Node Env Access", pattern: /process\.env\.([a-zA-Z0-9_]+)/g },
+        { name: "Hardcoded Env/Secret", pattern: /(NODE_ENV|DB_PASSWORD|API_KEY|ACCESS_TOKEN|SECRET_KEY)[\s:=]{1,3}["']([^"']+)["']/gi },
+        
+        // Generic High Entropy (Bearer tokens, etc)
+        { name: "Generic Secret", pattern: /(api_key|apikey|token|auth_token|access_token)[\s:=]{1,3}["']([a-zA-Z0-9_\-]{20,})["']/gi },
+        { name: "Authorization Header", pattern: /Authorization[\s:=]+["'](Bearer\s[a-zA-Z0-9_\-\.]{30,})["']/gi }
+    ];
+
+    // --- PROCESSING FUNCTIONS ---
+
+    function scanText(text, sourceName) {
+        // 1. Extract Endpoints
+        let match;
+        while ((match = regexEndpoint.exec(text)) !== null) {
+            // Clean up the match (remove quotes if grabbed)
+            let url = match[1];
+            // Filter out junk (css, images, standard html tags)
+            if (!url.match(/\.(png|jpg|jpeg|svg|css|woff|ttf)$/i) && !url.includes('<') && !url.includes('>')) {
+                results.endpoints.add({ url: url, source: sourceName });
+            }
+        }
+
+        // 2. Extract Secrets
+        regexSecrets.forEach(rule => {
+            while ((secretMatch = rule.pattern.exec(text)) !== null) {
+                // If it captures a group (value), use that. Otherwise use full match.
+                let content = secretMatch.length > 1 ? secretMatch[1] : secretMatch[0];
+                if (secretMatch.length > 2) content += ` = ${secretMatch[2]}`; // Handle Key = Value format
+                
+                results.secrets.add({ type: rule.name, content: content, source: sourceName });
             }
         });
     }
 
-    function findEndpoints(code) {
-        const urlPattern = /(https?:\/\/[^\s"'<>]+)|(\/[^\s"'<>]+\.[a-zA-Z0-9]{2,4}\b)/g;
-        let match;
-        while ((match = urlPattern.exec(code)) !== null) {
-            findings.push({ type: "🔗 Endpoint", content: match[0] });
-        }
-    }
+    // --- MAIN EXECUTION ---
 
-    // Process Inline Scripts
-    document.querySelectorAll('script:not([src])').forEach(script => {
-        const code = script.textContent;
-        findSecrets(code);
-        findEndpoints(code);
+    // 1. Get Static Files (The Inventory)
+    document.querySelectorAll('script[src]').forEach(s => {
+        if(s.src) results.staticFiles.add(s.src);
     });
 
-    // Process External Scripts
-    const scriptPromises = [];
-    document.querySelectorAll('script[src]').forEach(script => {
-        // FIX: Ignore the miner itself so we don't report our own code as secrets
-        if (script.src && !script.src.includes('js-miner.js')) {
-            scriptPromises.push(
-                fetch(script.src)
-                    .then(r => r.text())
-                    .then(code => { findSecrets(code); findEndpoints(code); })
-                    .catch(e => console.error(`Failed to fetch ${script.src}`, e))
-            );
-        }
+    // 2. Scan Inline Scripts
+    document.querySelectorAll('script:not([src])').forEach(s => {
+        scanText(s.innerText, "Inline Script");
     });
 
-    // 2. GENERATE UI
-    Promise.all(scriptPromises).then(() => {
-        const uniqueFindings = findings.filter((v,i,a)=>a.findIndex(t=>(t.content===v.content))===i);
+    // 3. Fetch & Scan External Files
+    const fetchPromises = Array.from(results.staticFiles).map(url => {
+        // Skip scanning the miner itself
+        if (url.includes('js-miner.js')) return Promise.resolve();
 
-        if (uniqueFindings.length === 0) {
-            alert("ArCHie's Miner: No secrets or endpoints found in target JS files.");
+        return fetch(url)
+            .then(r => r.text())
+            .then(text => scanText(text, url.split('/').pop())) // Pass filename as source
+            .catch(e => console.log(`Could not fetch ${url}`));
+    });
+
+    // --- REPORT GENERATION ---
+    Promise.all(fetchPromises).then(() => {
+        
+        // Convert Sets to Arrays for display
+        const staticArr = Array.from(results.staticFiles);
+        const endpointArr = Array.from(results.endpoints);
+        const secretArr = Array.from(results.secrets);
+
+        if (endpointArr.length === 0 && secretArr.length === 0 && staticArr.length === 0) {
+            alert("Min r finished. No significant data found.");
             return;
         }
 
-        const htmlContent = `
+        const html = `
             <!DOCTYPE html>
             <html>
             <head>
-                <title>JS Recon Report</title>
+                <title>JS Miner - ${document.location.hostname}</title>
                 <style>
-                    body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }
-                    h2 { color: #3fb950; border-bottom: 1px solid #30363d; padding-bottom: 10px; }
-                    table { width: 100%; border-collapse: collapse; margin-top: 10px; background: #161b22; }
-                    th { text-align: left; background: #21262d; padding: 10px; border: 1px solid #30363d; color: #fff; }
-                    td { padding: 8px; border: 1px solid #30363d; word-break: break-all; }
-                    .secret { color: #ff7b72; font-weight: bold; }
-                    .endpoint { color: #58a6ff; }
-                    .btn { background: #238636; color: white; border: none; padding: 10px; cursor: pointer; border-radius: 4px; font-weight: bold; margin-bottom: 15px; }
+                    body { background: #111; color: #ddd; font-family: 'Segoe UI', monospace; padding: 20px; }
+                    h2 { border-bottom: 2px solid #e67e22; padding-bottom: 5px; color: #e67e22; margin-top: 30px; }
+                    .stats { font-size: 0.9em; color: #888; }
+                    table { width: 100%; border-collapse: collapse; margin-top: 10px; background: #222; }
+                    th, td { padding: 10px; border: 1px solid #444; text-align: left; font-size: 0.9em; word-break: break-all; }
+                    th { background: #333; color: #fff; }
+                    tr:hover { background: #2a2a2a; }
+                    .tag { padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 0.8em; }
+                    .tag-js { background: #2980b9; color: white; }
+                    .tag-secret { background: #c0392b; color: white; }
+                    .tag-end { background: #27ae60; color: white; }
+                    .source { color: #888; font-size: 0.85em; font-style: italic; }
+                    .btn { position: fixed; top: 20px; right: 20px; padding: 10px 20px; background: #e67e22; color: white; border: none; cursor: pointer; font-weight: bold; border-radius: 4px; }
                 </style>
             </head>
             <body>
-                <h2>⚡ ArCHie opeRAtioNS JS Recon Report</h2>
-                <button class="btn" onclick="copyAll()">📋 Copy All</button>
+                <h1>🕵️ ArCHie's JS Miner</h1>
+                <div class="stats">Target: ${document.location.hostname}</div>
+                <button class="btn" onclick="copyReport()">Copy JSON Report</button>
+
+                <h2>🔐 Secrets & Env Vars (${secretArr.length})</h2>
                 <table>
-                    <thead><tr><th style="width: 15%">Type</th><th>Finding</th></tr></thead>
+                    <thead><tr><th>Type</th><th>Finding</th><th>Source File</th></tr></thead>
                     <tbody>
-                        ${uniqueFindings.map(f => `<tr><td class="${f.type.includes('Secret') ? 'secret' : 'endpoint'}">${f.type}</td><td>${f.content}</td></tr>`).join('')}
+                        ${secretArr.map(s => `<tr><td><span class="tag tag-secret">${s.type}</span></td><td style="color:#e74c3c; font-weight:bold;">${s.content}</td><td class="source">${s.source}</td></tr>`).join('')}
                     </tbody>
                 </table>
+
+                <h2>🔗 Endpoints / API Routes (${endpointArr.length})</h2>
+                <table>
+                    <thead><tr><th>URL/Path</th><th>Found In</th></tr></thead>
+                    <tbody>
+                        ${endpointArr.map(e => `<tr><td><a href="${e.url}" target="_blank" style="color:#2ecc71; text-decoration:none;">${e.url}</a></td><td class="source">${e.source}</td></tr>`).join('')}
+                    </tbody>
+                </table>
+
+                <h2>📂 Static JS Files (${staticArr.length})</h2>
+                <table>
+                    <thead><tr><th>File URL</th></tr></thead>
+                    <tbody>
+                        ${staticArr.map(f => `<tr><td><a href="${f}" target="_blank" style="color:#3498db;">${f}</a></td></tr>`).join('')}
+                    </tbody>
+                </table>
+
                 <script>
-                    function copyAll() {
-                        const data = ${JSON.stringify(uniqueFindings)};
-                        const text = data.map(i => i.type + " | " + i.content).join('\\n');
-                        navigator.clipboard.writeText(text).then(() => alert('Copied!'));
+                    function copyReport() {
+                        const report = {
+                            secrets: ${JSON.stringify(secretArr)},
+                            endpoints: ${JSON.stringify(endpointArr)},
+                            files: ${JSON.stringify(staticArr)}
+                        };
+                        navigator.clipboard.writeText(JSON.stringify(report, null, 2)).then(() => alert("JSON Report Copied!"));
                     }
                 </script>
             </body>
             </html>
         `;
 
-        const win = window.open("", "ArCHie opeRAtioNSRecon", "width=900,height=700,scrollbars=yes,resizable=yes");
-        if (win) { win.document.open(); win.document.write(htmlContent); win.document.close(); win.focus(); }
-        else { alert("⚠️ Popup Blocked!"); }
+        const win = window.open("", "JSMiner", "width=1000,height=800,scrollbars=yes,resizable=yes");
+        if(win) {
+            win.document.open();
+            win.document.write(html);
+            win.document.close();
+            win.focus();
+        } else {
+            alert("⚠️ Popup blocked. Please allow popups for this site.");
+        }
     });
 })();
